@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "paper-boot"
+version = "0.1.0"
+description = "Automate the setup of academic ML repositories"
+requires-python = ">=3.9"
+dependencies = ["click"]
+
+[project.scripts]
+paper-boot = "paper_boot:main"
