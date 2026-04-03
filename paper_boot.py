@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """paper-boot: automate the setup of academic ML repositories."""
 
+import json
 import re
 import subprocess
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import click
@@ -27,6 +31,13 @@ MODERN_PYTORCH_INSTALL = (
     "-c pytorch -c nvidia -y"
 )
 
+ARXIV_ID_RE = re.compile(r"(\d{4}\.\d{4,5})(v\d+)?")
+GITHUB_REPO_RE = re.compile(r"https?://github\.com/[\w.-]+/[\w.-]+")
+
+# Paths on github.com that are not repositories
+_GITHUB_NON_REPO = {"topics", "features", "settings", "explore", "marketplace",
+                    "notifications", "login", "signup", "pricing", "about"}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -49,6 +60,166 @@ def _has_torch_in_conda_env(dep_path: Path) -> bool:
         if _is_torch_line(line):
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# arXiv → GitHub repo resolution
+# ---------------------------------------------------------------------------
+def _is_arxiv_input(source: str) -> bool:
+    """Return True if the source looks like an arXiv ID or URL rather than a GitHub URL."""
+    return bool(ARXIV_ID_RE.search(source)) and "github.com" not in source
+
+
+def parse_arxiv_id(source: str) -> str:
+    """Extract a bare arXiv ID (e.g. '2305.12345') from a URL or raw ID."""
+    m = ARXIV_ID_RE.search(source)
+    if m:
+        return m.group(1)
+    raise click.ClickException(f"Could not parse arXiv ID from: {source}")
+
+
+def _normalize_github_url(url: str) -> str | None:
+    """Normalize a GitHub URL to https://github.com/owner/repo, or None if invalid."""
+    url = url.rstrip("/")
+    if url.endswith(".git"):
+        url = url[:-4]
+    # Strip fragments, query strings, and deep paths beyond owner/repo
+    parsed = urllib.parse.urlparse(url)
+    parts = [p for p in parsed.path.strip("/").split("/") if p]
+    if len(parts) < 2:
+        return None
+    owner, repo = parts[0], parts[1]
+    if owner.lower() in _GITHUB_NON_REPO:
+        return None
+    return f"https://github.com/{owner}/{repo}"
+
+
+def _urlopen_safe(url: str, *, timeout: int = 15, headers: dict | None = None) -> bytes:
+    """Fetch a URL, returning bytes. Raises click.ClickException on failure."""
+    hdrs = {"User-Agent": "paper-boot/0.1"}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, headers=hdrs)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except Exception as exc:
+        raise click.ClickException(f"HTTP request failed ({url}): {exc}")
+
+
+def fetch_arxiv_metadata(arxiv_id: str) -> dict:
+    """Fetch title, abstract, and any GitHub links from the arXiv API."""
+    api_url = f"https://export.arxiv.org/api/query?id_list={arxiv_id}"
+    xml_bytes = _urlopen_safe(api_url)
+    ns = {"atom": "http://www.w3.org/2005/Atom",
+          "arxiv": "http://arxiv.org/schemas/atom"}
+    root = ET.fromstring(xml_bytes)
+    entry = root.find("atom:entry", ns)
+    if entry is None:
+        raise click.ClickException(f"No arXiv entry found for {arxiv_id}")
+
+    title = " ".join((entry.findtext("atom:title", "", ns)).split())
+    abstract = entry.findtext("atom:summary", "", ns).strip()
+
+    # Collect GitHub URLs from <link> elements and the arxiv:comment field
+    github_urls: list[str] = []
+    for link in entry.findall("atom:link", ns):
+        href = link.get("href", "")
+        if "github.com" in href:
+            github_urls.append(href)
+    comment = entry.findtext("arxiv:comment", "", ns) or ""
+    github_urls.extend(GITHUB_REPO_RE.findall(comment))
+    # Also scan the abstract itself (some authors embed repo links)
+    github_urls.extend(GITHUB_REPO_RE.findall(abstract))
+
+    return {"title": title, "abstract": abstract,
+            "github_links": github_urls, "arxiv_id": arxiv_id}
+
+
+def search_paperswithcode(arxiv_id: str) -> list[str]:
+    """Query Papers with Code for repos linked to this arXiv paper."""
+    try:
+        data = json.loads(_urlopen_safe(
+            f"https://paperswithcode.com/api/v1/papers/?arxiv_id={arxiv_id}",
+            headers={"Accept": "application/json"},
+        ))
+        results = data.get("results", [])
+        if not results:
+            return []
+        paper_id = results[0].get("id")
+        if not paper_id:
+            return []
+        repos_data = json.loads(_urlopen_safe(
+            f"https://paperswithcode.com/api/v1/papers/{paper_id}/repositories/",
+            headers={"Accept": "application/json"},
+        ))
+        repos = repos_data.get("results", [])
+        # Official repos first, then by stars descending
+        repos.sort(key=lambda r: (not r.get("is_official", False),
+                                  -(r.get("stars", 0) or 0)))
+        return [r["url"] for r in repos if r.get("url")]
+    except click.ClickException:
+        return []
+
+
+def search_arxiv_page_for_github(arxiv_id: str) -> list[str]:
+    """Scrape the arXiv abstract page HTML for GitHub links."""
+    try:
+        html = _urlopen_safe(f"https://arxiv.org/abs/{arxiv_id}").decode(errors="replace")
+        return GITHUB_REPO_RE.findall(html)
+    except click.ClickException:
+        return []
+
+
+def find_repo_for_paper(arxiv_id: str) -> str:
+    """Resolve an arXiv ID to a GitHub repo URL. Prompts user if ambiguous."""
+    cyan = lambda s: click.style(s, fg="cyan")
+
+    click.echo(click.style("Fetching paper metadata from arXiv …", fg="blue"))
+    meta = fetch_arxiv_metadata(arxiv_id)
+    click.echo(f"  Paper: {cyan(meta['title'])}")
+    click.echo()
+
+    candidates: list[str] = []
+
+    # 1. Direct links from arXiv metadata
+    candidates.extend(meta["github_links"])
+
+    # 2. Papers with Code
+    click.echo(click.style("Searching Papers with Code …", fg="blue"))
+    candidates.extend(search_paperswithcode(arxiv_id))
+
+    # 3. Scrape arXiv abstract page
+    if not candidates:
+        click.echo(click.style("Searching arXiv page for GitHub links …", fg="blue"))
+        candidates.extend(search_arxiv_page_for_github(arxiv_id))
+
+    # Normalize and deduplicate
+    seen: set[str] = set()
+    unique: list[str] = []
+    for raw in candidates:
+        norm = _normalize_github_url(raw)
+        if norm and norm not in seen:
+            seen.add(norm)
+            unique.append(norm)
+
+    if not unique:
+        raise click.ClickException(
+            f"No GitHub repository found for arXiv:{arxiv_id}.\n"
+            f"  Paper: {meta['title']}\n"
+            f"  Try searching manually and use:  paper-boot <github_url>"
+        )
+
+    if len(unique) == 1:
+        click.echo(click.style("Found repository: ", fg="green", bold=True) + unique[0])
+        return unique[0]
+
+    # Multiple candidates — let user pick
+    click.echo(click.style("Multiple repositories found:", fg="yellow", bold=True))
+    for i, url in enumerate(unique, 1):
+        click.echo(f"  [{i}] {url}")
+    choice = click.prompt("Select repository", type=click.IntRange(1, len(unique)), default=1)
+    return unique[choice - 1]
 
 
 # ---------------------------------------------------------------------------
@@ -207,9 +378,18 @@ def print_summary(
 # CLI entry point
 # ---------------------------------------------------------------------------
 @click.command()
-@click.argument("github_url")
-def main(github_url: str) -> None:
-    """Clone a GitHub repo and scaffold a run_baseline.sh setup script."""
+@click.argument("source")
+def main(source: str) -> None:
+    """Clone a GitHub repo (or find one from an arXiv paper) and scaffold run_baseline.sh.
+
+    SOURCE can be a GitHub URL, an arXiv ID (e.g. 2305.12345), or an arXiv URL.
+    """
+    if _is_arxiv_input(source):
+        arxiv_id = parse_arxiv_id(source)
+        github_url = find_repo_for_paper(arxiv_id)
+    else:
+        github_url = source
+
     click.echo(click.style(f"Cloning {github_url} …", fg="blue"))
 
     repo_path = clone_repo(github_url)
